@@ -33,6 +33,8 @@ extern List * ExtendedDDLCommandList(Oid masterRelationId, int64 shardId,
 extern void AppendShardIdToName(char **name, int64 shardId);
 extern bool ExecuteRemoteCommandList(char *nodeName, uint32 nodePort,
 									 List *sqlCommandList);
-
+extern bool ExecuteRemotePreparedCommandList(char *nodeName, uint32 nodePort,
+									 List *sqlCommandList);
+int CompareWorkerNodes(const void *leftElement, const void *rightElement);
 
 #endif /* PG_SHARD_DDL_COMMANDS_H */

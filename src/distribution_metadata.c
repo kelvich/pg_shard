@@ -16,6 +16,8 @@
 #include "miscadmin.h"
 
 #include "distribution_metadata.h"
+#include "create_shards.h"
+#include "ddl_commands.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -39,6 +41,13 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
+
+
+
+
+#define INSERT_INTO_PARTITION_ROW "INSERT INTO pgs_distribution_metadata.partition \
+								(relation_id, partition_method, key) VALUES \
+								(%u, '%c', '%s')"
 
 
 /*
@@ -619,6 +628,30 @@ TupleToShardPlacement(HeapTuple heapTuple, TupleDesc tupleDescriptor)
 }
 
 
+static void
+InsertLocalPartitionRow(Oid distributedTableId, char partitionType, text *partitionKeyText)
+{
+
+	Oid argTypes[] = { OIDOID, CHAROID, TEXTOID };
+	Datum argValues[] = {
+			ObjectIdGetDatum(distributedTableId),
+			CharGetDatum(partitionType),
+			PointerGetDatum(partitionKeyText)};
+	const int argCount = sizeof(argValues) / sizeof(argValues[0]);
+	int spiStatus PG_USED_FOR_ASSERTS_ONLY = 0;
+
+	SPI_connect();
+
+	spiStatus = SPI_execute_with_args("INSERT INTO pgs_distribution_metadata.partition "
+			"(relation_id, partition_method, key) "
+			"VALUES ($1, $2, $3)", argCount, argTypes,
+			argValues, NULL, false, 0);
+	Assert(spiStatus == SPI_OK_INSERT);
+
+	SPI_finish();
+
+}
+
 /*
  * InsertPartitionRow inserts a new row into the partition table using the
  * supplied values.
@@ -626,24 +659,95 @@ TupleToShardPlacement(HeapTuple heapTuple, TupleDesc tupleDescriptor)
 void
 InsertPartitionRow(Oid distributedTableId, char partitionType, text *partitionKeyText)
 {
-	Oid argTypes[] = { OIDOID, CHAROID, TEXTOID };
-	Datum argValues[] = {
-		ObjectIdGetDatum(distributedTableId),
-		CharGetDatum(partitionType),
-		PointerGetDatum(partitionKeyText)
-	};
-	const int argCount = sizeof(argValues) / sizeof(argValues[0]);
-	int spiStatus PG_USED_FOR_ASSERTS_ONLY = 0;
 
-	SPI_connect();
+	List *coordinatorNodeList = NIL;
+	List *prepareTransactionCommands = NIL;
+	uint32 coordinatorNodeCount = 0;
+	uint32 coordinatorNodeIndex = 0;
+	bool coordinatorsPrepared = true;
 
-	spiStatus = SPI_execute_with_args("INSERT INTO pgs_distribution_metadata.partition "
-									  "(relation_id, partition_method, key) "
-									  "VALUES ($1, $2, $3)", argCount, argTypes,
-									  argValues, NULL, false, 0);
-	Assert(spiStatus == SPI_OK_INSERT);
+	/* load and sort the worker node list for deterministic placement */
+	coordinatorNodeList = ParseWorkerNodeFile(WORKER_LIST_FILENAME);
+	coordinatorNodeList = SortList(coordinatorNodeList, CompareWorkerNodes);
 
-	SPI_finish();
+	coordinatorNodeCount = list_length(coordinatorNodeList);
+
+	prepareTransactionCommands = PartitionRowPrepareTransactionCommands(distributedTableId,
+																		partitionType,
+																		partitionKeyText);
+
+	/* prepare phase for the coordinators */
+	for (coordinatorNodeIndex = 0; coordinatorNodeIndex < coordinatorNodeCount; ++coordinatorNodeIndex)
+	{
+		WorkerNode *coordinatorNode = (WorkerNode *) list_nth(coordinatorNodeList,
+															  coordinatorNodeIndex);
+		char *nodeName = coordinatorNode->nodeName;
+		uint32 nodePort = coordinatorNode->nodePort;
+
+		bool preparedSuccess = ExecuteRemotePreparedCommandList(nodeName, nodePort,
+																prepareTransactionCommands);
+
+		coordinatorsPrepared = coordinatorsPrepared && preparedSuccess;
+
+		/* if not all of them are happy with the transaction */
+		if (!coordinatorsPrepared)
+		{
+			/* in real world, ABORT the PREPARED TRANSACTIONs that you already opened */
+			elog(INFO, "Not all masters agreed on the transaction, "
+						"parititon metadata is not added for the table");
+		}
+	}
+
+	/* now,  commit all prepared transactions */
+	for (coordinatorNodeIndex = 0; coordinatorNodeIndex < coordinatorNodeCount; ++coordinatorNodeIndex)
+	{
+		bool commitSuccess = false;
+		WorkerNode *coordinatorNode = (WorkerNode *) list_nth(coordinatorNodeList,
+															  coordinatorNodeIndex);
+		char *nodeName = coordinatorNode->nodeName;
+		uint32 nodePort = coordinatorNode->nodePort;
+		char *commitPreparedCommant = "COMMIT PREPARED 'update_metadata'";
+		List *commitCommandList = NIL;
+
+		commitCommandList = lappend(commitCommandList, commitPreparedCommant);
+		commitCommandList = lappend(commitCommandList, COMMIT_COMMAND);
+
+		commitSuccess = ExecuteRemotePreparedCommandList(nodeName, nodePort,
+															  commitCommandList);
+
+		/* if not all of them are happy with the transaction */
+		if (!commitSuccess)
+		{
+			elog(INFO, "One of the commits failed. We should keep track of which "
+						"errored out. We may need to issue commit later on");
+		}
+	}
+
+	/* lastly INSERT local row, it should somehow be merged with the above schema */
+	InsertLocalPartitionRow(distributedTableId, partitionType, partitionKeyText);
+
+}
+
+
+List *
+PartitionRowPrepareTransactionCommands(Oid distributedTableId, char partitionType,
+									   text *partitionKeyText)
+{
+	List *commands = NIL;
+	char *beginTransaction = "PREPARE TRANSACTION 'update_metadata'";
+	StringInfo insertString = makeStringInfo();
+
+	appendStringInfo(insertString, INSERT_INTO_PARTITION_ROW, distributedTableId,
+					 partitionType, text_to_cstring(partitionKeyText) );
+
+	elog(INFO, "Insert String: %s", insertString->data);
+
+
+	commands = lappend(commands, BEGIN_COMMAND);
+	commands = lappend(commands, insertString->data);
+	commands = lappend(commands, beginTransaction);
+
+	return commands;
 }
 
 

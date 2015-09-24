@@ -41,6 +41,8 @@ typedef struct WorkerNode
 extern List * SortList(List *pointerList,
 					   int (*ComparisonFunction)(const void *, const void *));
 extern Oid ResolveRelationId(text *relationName);
+extern List * ParseWorkerNodeFile(char *workerNodeFilename);
+
 
 /* function declarations for initializing a distributed table */
 extern Datum master_create_distributed_table(PG_FUNCTION_ARGS);

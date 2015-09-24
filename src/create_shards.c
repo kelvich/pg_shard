@@ -50,8 +50,6 @@
 
 /* local function forward declarations */
 static void CheckHashPartitionedTable(Oid distributedTableId);
-static List * ParseWorkerNodeFile(char *workerNodeFilename);
-static int CompareWorkerNodes(const void *leftElement, const void *rightElement);
 static bool ExecuteRemoteCommand(PGconn *connection, const char *sqlCommand);
 static text * IntegerToText(int32 value);
 static Oid SupportFunctionForColumn(Var *partitionColumn, Oid accessMethodId,
@@ -372,7 +370,7 @@ CheckHashPartitionedTable(Oid distributedTableId)
  * specified configuration file. The function relies on the file being at the
  * top level in the data directory.
  */
-static List *
+List *
 ParseWorkerNodeFile(char *workerNodeFilename)
 {
 	FILE *workerFileStream = NULL;
@@ -532,7 +530,7 @@ SortList(List *pointerList, int (*ComparisonFunction)(const void *, const void *
 
 
 /* Helper function to compare two workers by their node name and port number. */
-static int
+int
 CompareWorkerNodes(const void *leftElement, const void *rightElement)
 {
 	const WorkerNode *leftNode = *((const WorkerNode **) leftElement);
@@ -597,6 +595,43 @@ ExecuteRemoteCommandList(char *nodeName, uint32 nodePort, List *sqlCommandList)
 		}
 	}
 	else
+	{
+		ExecuteRemoteCommand(connection, ROLLBACK_COMMAND);
+		commandListExecuted = false;
+	}
+
+	return commandListExecuted;
+}
+
+
+/*
+* Do not execute COMMIT; END, just execute the commands on the sqlCommandList
+ */
+bool
+ExecuteRemotePreparedCommandList(char *nodeName, uint32 nodePort, List *sqlCommandList)
+{
+	bool commandListExecuted = true;
+	ListCell *sqlCommandCell = NULL;
+	bool sqlCommandIssued = false;
+
+	PGconn *connection = GetConnection(nodeName, nodePort);
+	if (connection == NULL)
+	{
+		return false;
+	}
+
+	foreach(sqlCommandCell, sqlCommandList)
+	{
+		char *sqlCommand = (char *) lfirst(sqlCommandCell);
+
+		sqlCommandIssued = ExecuteRemoteCommand(connection, sqlCommand);
+		if (!sqlCommandIssued)
+		{
+			break;
+		}
+	}
+
+	if (!sqlCommandIssued)
 	{
 		ExecuteRemoteCommand(connection, ROLLBACK_COMMAND);
 		commandListExecuted = false;
